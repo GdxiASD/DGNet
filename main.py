@@ -28,8 +28,6 @@ parser.add_argument('--train_epochs', type=int, default=100, help='train epochs'
 parser.add_argument('--batch_size', type=int, default=64, help='input data batch size')
 parser.add_argument('--validate_freq', type=int, default=1, help='')
 parser.add_argument('--early_stop', type=bool, default=True, help='')
-parser.add_argument('--optimizer', type=str, default='adam', help='RMSprop, adam')
-parser.add_argument('--loss_function', type=str, default='MAE', help='MSE, MAE, both')
 parser.add_argument('--seed', type=int, default=20231121, help='random seed')
 # learning rate scheduler
 parser.add_argument('--learning_rate', type=float, default=2e-04, help='optimizer learning rate')
@@ -42,7 +40,7 @@ parser.add_argument('--pre_length', type=int, default=12, help='predict length')
 parser.add_argument('--in_dim', type=int, default=1, help='')
 parser.add_argument('--embed_size', type=int, default=32, help='embedding dimensions')
 parser.add_argument('--hidden_size', type=int, default=32, help='hidden dimensions')
-parser.add_argument('--layer', type=int, default=2, help='diffusion steps')
+parser.add_argument('--order', type=int, default=2, help='diffusion steps')
 parser.add_argument('--linear', type=int, default=3, help='MLP layer num')
 parser.add_argument('--blocks', type=int, default=6, help='model stack num')
 parser.add_argument('--scale', type=int, default=1, help='adaptive weight scale')
@@ -57,7 +55,6 @@ parser.add_argument('--is_graph_shared', default=False, action='store_true', hel
 
 # adaptive matrix setting
 parser.add_argument('--alpha', type=int, default=3, help='tanh activation expansion rate')
-parser.add_argument('--beta', type=float, default=0.5, help='self-node weight')
 parser.add_argument('--dim_time_emb', type=int, default=64, help='')
 parser.add_argument('--dim_graph_emb', type=int, default=64, help='')
 args = parser.parse_args()
@@ -77,9 +74,9 @@ setting = 'id-{}_fs{}_pl{}_sl{}_ems{}_hs{}_bas{}_K{}_b{}_ab{}_bi{}_indim{}_gr{}_
     args.embed_size,
     args.hidden_size,
     args.batch_size,
-    args.layer,
+    args.order,
     args.blocks,
-    f'{args.alpha}+{args.beta}',
+    f'{args.alpha}',
     args.bi,
     args.in_dim,
     args.graph_regenerate,
@@ -126,31 +123,15 @@ val_dataloader = DataLoader(val_set, batch_size=args.batch_size, shuffle=True, n
 model = DGNetv2(pre_length=args.pre_length, embed_size=args.embed_size, feature_size=args.feature_size,
                 seq_length=args.seq_length, hidden_size=args.hidden_size, device=device,
                 graph_regenerate=args.graph_regenerate, in_dim=args.in_dim, linear=args.linear, scale=args.scale,
-                layers=args.layer, blocks=args.blocks, dim_time_emb=args.dim_time_emb,
+                order=args.order, blocks=args.blocks, dim_time_emb=args.dim_time_emb,
                 dim_graph_emb=args.dim_graph_emb, GCN=args.GCN, TCN=args.TCN, blocks_gate=args.blocks_gate,
-                is_graph_shared=args.is_graph_shared, alpha=args.alpha, beta=args.beta)
+                is_graph_shared=args.is_graph_shared, alpha=args.alpha)
 parameter_number = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(" Parameters Volume: ", parameter_number)
 
-if args.optimizer == 'adam':
-    my_optim = torch.optim.Adam(params=model.parameters(), lr=args.learning_rate, eps=1e-08, weight_decay=1e-4)
-elif args.optimizer == 'RMSprop':
-    my_optim = torch.optim.RMSprop(params=model.parameters(), lr=args.learning_rate, eps=1e-08)
-elif args.optimizer == 'adamw':
-    my_optim = torch.optim.AdamW(params=model.parameters(), lr=args.learning_rate, eps=1e-08)
-else:
-    raise NameError(f'{args.optimizer} is not defined.')
-
+my_optim = torch.optim.Adam(params=model.parameters(), lr=args.learning_rate, eps=1e-08, weight_decay=1e-4)
 my_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=my_optim, gamma=args.decay_rate)
-
-if args.loss_function == 'MSE':
-    forecast_loss = nn.MSELoss(reduction='mean').to(device)
-elif args.loss_function == 'MAE':
-    forecast_loss = nn.L1Loss(reduction='mean').to(device)
-elif args.loss_function == 'both':
-    forecast_loss = loss
-else:
-    raise NameError(f'{args.loss_function} is not defined.')
+forecast_loss = nn.L1Loss(reduction='mean').to(device)
 
 
 def validate(model, vali_loader):
@@ -181,18 +162,14 @@ def validate(model, vali_loader):
     preds = np.concatenate(preds, axis=0)
     trues = np.concatenate(trues, axis=0)
     score = evaluate(trues, preds)
-    print(f'RAW : MAPE {score[0]:7.9%}; MAE {score[1]:7.9f}; RMSE {score[2]:7.9f}.')
+    print(f'Validate: Average--all. MAPE {score[0]:7.9%}, MAE {score[1]:7.9f}, RMSE {score[2]:7.9f}.')
     model.train()
     return loss_total / cnt, score
 
 
-def test(absolute_path=None, epoch=None, best_model=None):
-    result_test_file = result_train_file
-    if absolute_path is None:
-        if best_model is not None:
-            model = best_model
-        else:
-            model = load_model(result_test_file, epoch)
+def test(absolute_path=None, best_model_var=None):
+    if absolute_path is None and best_model_var is not None:
+        model = best_model_var
     else:
         model = torch.load(absolute_path)
     model.eval()
@@ -218,10 +195,10 @@ def test(absolute_path=None, epoch=None, best_model=None):
     preds = np.concatenate(preds, axis=0)
     trues = np.concatenate(trues, axis=0)
     score = evaluate(trues, preds, by_node=True)
-    for i in [2, 5, 8, 11]:
-        print(f'TEST RAW :Horizon--{i + 1}, MAPE {score[0][i]:7.4%}; MAE {score[1][i]:7.4f}; RMSE {score[2][i]:7.4f}.')
+    for i in [2, 5, 11]:
+        print(f'Test: Horizon--{i + 1}. MAPE {score[0][i]:7.4%}, MAE {score[1][i]:7.4f}, RMSE {score[2][i]:7.4f}.')
     score = evaluate(trues, preds)
-    print(f'TEST RAW :Average-all, MAPE {score[0]:7.4%}; MAE {score[1]:7.4f}; RMSE {score[2]:7.4f}.')
+    print(f'Test: Average--all. MAPE {score[0]:7.4%}, MAE {score[1]:7.4f}, RMSE {score[2]:7.4f}.')
     return score
 
 
@@ -275,10 +252,9 @@ if __name__ == '__main__':
                 best_model = model
                 train_min_loss = loss_total / cnt
                 best_epoch = epoch
-                test(best_model=best_model)
+                test(best_model_var=best_model)
         runtime_list.append(time.time() - epoch_start_time)
-        print(
-            'end of epoch {:3d} | time: {:5.2f}s | train_total_loss {:5.4f} | val_loss {:5.6f} | best epoch {}'.format(
+        print('Epoch {:3d} | time: {:5.2f}s | train_loss {:5.4f} | val_loss {:5.6f} | best epoch {}'.format(
                 epoch, runtime_list[-1], loss_total / cnt, val_loss, best_epoch))
         train_loss.append(loss_total / cnt)
         save_model(model, result_train_file+r'./train', epoch=epoch, val_loss=val_loss)
@@ -287,5 +263,5 @@ if __name__ == '__main__':
             break
     mean_runtime = np.mean(np.array(runtime_list))
     print(f'epoch:{best_epoch}. loss:{val_min_loss}. mean runtime:{mean_runtime}')
-    best_model_file_name = save_model(best_model, result_train_file+r'./train', val_loss=val_min_loss)  # save best model
+    best_model_file_name = save_model(best_model, result_train_file+r'./train', val_loss=val_min_loss)
     score = test(absolute_path=best_model_file_name)
